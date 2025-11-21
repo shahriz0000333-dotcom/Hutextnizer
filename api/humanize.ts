@@ -83,29 +83,29 @@ export default async function handler(req: any, res: any) {
       },
     });
 
-    // FIX: Replaced fragile JSON parsing with a more robust method.
-    // The previous implementation using `indexOf` and `lastIndexOf` was brittle and could fail with nested objects or certain string values.
-    // With `responseMimeType: 'application/json'`, the response should be a clean JSON string.
-    // This logic attempts to parse it directly and includes a fallback for stripping common markdown wrappers.
-    let responseText = response.text?.trim();
+    const responseText = response.text?.trim();
 
     if (!responseText) {
         throw new Error("Received an empty response from the AI model.");
     }
     
-    // The model can sometimes wrap the JSON in ```json ... ```. Let's strip it.
-    if (responseText.startsWith('```json')) {
-      responseText = responseText.substring(7, responseText.length - 3).trim();
-    } else if (responseText.startsWith('```')) {
-      responseText = responseText.substring(3, responseText.length - 3).trim();
+    // FIX: Use a robust regex to extract the JSON object from the response string.
+    // This handles cases where the model might add extra text before or after the JSON block.
+    const jsonMatch = responseText.match(/{[\s\S]*}/);
+
+    if (!jsonMatch) {
+      console.error("Could not find a JSON object in the AI response. Raw response:", responseText);
+      throw new Error("The AI model response did not contain a recognizable JSON object.");
     }
     
+    const jsonString = jsonMatch[0];
     let parsedJson: AiResponse;
+
     try {
-        parsedJson = JSON.parse(responseText);
+        parsedJson = JSON.parse(jsonString);
     } catch (jsonError) {
-        console.error("Failed to parse JSON from AI. Processed string:", responseText);
-        console.error("Raw response was:", response.text);
+        console.error("Failed to parse extracted JSON string:", jsonString);
+        console.error("Raw AI response was:", responseText);
         throw new Error("The AI model returned a response that was not valid JSON.");
     }
     

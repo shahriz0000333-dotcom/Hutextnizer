@@ -12,13 +12,13 @@ export interface AiResponse {
   report: ReportData;
 }
 
-// FIX: Defined the AIStudio interface to resolve a TypeScript error about subsequent property declarations.
-interface AIStudio {
-  hasSelectedApiKey: () => Promise<boolean>;
-  openSelectKey: () => Promise<void>;
-}
-
 declare global {
+  // FIX: Moved the AIStudio interface into `declare global` to make it a truly global type. This resolves the "Subsequent property declarations must have the same type" error by ensuring all augmentations of `window.aistudio` refer to the same interface.
+  interface AIStudio {
+    hasSelectedApiKey: () => Promise<boolean>;
+    openSelectKey: () => Promise<void>;
+  }
+
   interface Window {
     jspdf: any;
     html2canvas: any;
