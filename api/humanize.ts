@@ -18,6 +18,55 @@ interface AiResponse {
   report: ReportData;
 }
 
+/**
+ * Attempts to extract and parse a JSON object from a string that may contain extraneous text
+ * or be wrapped in markdown code blocks.
+ * @param text The raw string response from the AI model.
+ * @returns The parsed AiResponse object or null if parsing fails.
+ */
+function extractAndParseJson(text: string): AiResponse | null {
+  if (!text) return null;
+
+  // Attempt 1: The text is already a valid JSON object.
+  try {
+    const parsed = JSON.parse(text);
+    // Basic validation to ensure it matches our expected structure
+    if (parsed && parsed.processedText && parsed.report) {
+      return parsed as AiResponse;
+    }
+  } catch (e) {
+    // Not a valid JSON, proceed to next attempts.
+  }
+
+  // Attempt 2: The JSON is wrapped in a markdown code block (e.g., ```json ... ```).
+  const markdownMatch = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+  if (markdownMatch && markdownMatch[1]) {
+    try {
+      const parsed = JSON.parse(markdownMatch[1]);
+      if (parsed && parsed.processedText && parsed.report) {
+        return parsed as AiResponse;
+      }
+    } catch (e) {
+      // Failed to parse content of markdown block, proceed.
+    }
+  }
+  
+  // Attempt 3: The JSON is embedded within other text. Find the first '{' and last '}'.
+  const jsonMatch = text.match(/{[\s\S]*}/);
+  if (jsonMatch && jsonMatch[0]) {
+    try {
+      const parsed = JSON.parse(jsonMatch[0]);
+       if (parsed && parsed.processedText && parsed.report) {
+        return parsed as AiResponse;
+      }
+    } catch (e) {
+      // The extracted substring is not valid JSON.
+    }
+  }
+
+  return null; // All attempts failed.
+}
+
 // Vercel serverless function handler
 export default async function handler(req: any, res: any) {
   if (req.method !== 'POST') {
@@ -61,20 +110,18 @@ export default async function handler(req: any, res: any) {
     };
 
     const prompt = `
-      Your sole task is to process the user's text.
-      Humanize the text to make it sound natural, improve its flow, and ensure it is original.
-      You MUST output your response as a single, raw, valid JSON object, and nothing else.
-      Do not include any wrapper like \`\`\`json ... \`\`\`, any conversational text, or any explanations.
-      Your entire output must be parsable by JSON.parse().
-      The JSON must conform to the provided schema.
+      You are an AI text processor. Your task is to humanize the user's text, improve its flow, and ensure originality.
+      You MUST provide your response strictly as a single, raw, valid JSON object that conforms to the provided schema.
+      Do not include any markdown wrappers like \`\`\`json, conversational text, or explanations.
+      Your entire output must be a JSON object parsable by JSON.parse().
 
-      Original Text:
+      Original Text to process:
       ---
       ${text}
       ---
     `;
 
-    const response = await ai.models.generateContent({
+    const modelResponse = await ai.models.generateContent({
       model: 'gemini-2.5-flash',
       contents: prompt,
       config: {
@@ -83,38 +130,20 @@ export default async function handler(req: any, res: any) {
       },
     });
 
-    const responseText = response.text?.trim();
+    const responseText = modelResponse.text?.trim();
 
     if (!responseText) {
-        throw new Error("Received an empty response from the AI model.");
+      throw new Error("Received an empty response from the AI model.");
     }
     
-    // FIX: Use a robust regex to extract the JSON object from the response string.
-    // This handles cases where the model might add extra text before or after the JSON block.
-    const jsonMatch = responseText.match(/{[\s\S]*}/);
-
-    if (!jsonMatch) {
-      console.error("Could not find a JSON object in the AI response. Raw response:", responseText);
-      throw new Error("The AI model response did not contain a recognizable JSON object.");
-    }
+    const parsedJson = extractAndParseJson(responseText);
     
-    const jsonString = jsonMatch[0];
-    let parsedJson: AiResponse;
-
-    try {
-        parsedJson = JSON.parse(jsonString);
-    } catch (jsonError) {
-        console.error("Failed to parse extracted JSON string:", jsonString);
-        console.error("Raw AI response was:", responseText);
-        throw new Error("The AI model returned a response that was not valid JSON.");
-    }
-    
-    if (parsedJson && parsedJson.processedText && parsedJson.report) {
+    if (parsedJson) {
       res.setHeader('Content-Type', 'application/json');
       return res.status(200).json(parsedJson);
     } else {
-      console.error("Parsed JSON is missing required properties. Parsed object:", parsedJson);
-      throw new Error("Received incomplete or malformed data structure from the AI.");
+      console.error("Failed to extract a valid JSON object from the AI's response. Raw response:", responseText);
+      throw new Error("The AI model's response could not be parsed as valid JSON.");
     }
     
   } catch (error) {
