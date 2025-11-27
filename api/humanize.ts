@@ -18,55 +18,6 @@ interface AiResponse {
   report: ReportData;
 }
 
-/**
- * Attempts to extract and parse a JSON object from a string that may contain extraneous text
- * or be wrapped in markdown code blocks.
- * @param text The raw string response from the AI model.
- * @returns The parsed AiResponse object or null if parsing fails.
- */
-function extractAndParseJson(text: string): AiResponse | null {
-  if (!text) return null;
-
-  // Attempt 1: The text is already a valid JSON object.
-  try {
-    const parsed = JSON.parse(text);
-    // Basic validation to ensure it matches our expected structure
-    if (parsed && parsed.processedText && parsed.report) {
-      return parsed as AiResponse;
-    }
-  } catch (e) {
-    // Not a valid JSON, proceed to next attempts.
-  }
-
-  // Attempt 2: The JSON is wrapped in a markdown code block (e.g., ```json ... ```).
-  const markdownMatch = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-  if (markdownMatch && markdownMatch[1]) {
-    try {
-      const parsed = JSON.parse(markdownMatch[1]);
-      if (parsed && parsed.processedText && parsed.report) {
-        return parsed as AiResponse;
-      }
-    } catch (e) {
-      // Failed to parse content of markdown block, proceed.
-    }
-  }
-  
-  // Attempt 3: The JSON is embedded within other text. Find the first '{' and last '}'.
-  const jsonMatch = text.match(/{[\s\S]*}/);
-  if (jsonMatch && jsonMatch[0]) {
-    try {
-      const parsed = JSON.parse(jsonMatch[0]);
-       if (parsed && parsed.processedText && parsed.report) {
-        return parsed as AiResponse;
-      }
-    } catch (e) {
-      // The extracted substring is not valid JSON.
-    }
-  }
-
-  return null; // All attempts failed.
-}
-
 // Vercel serverless function handler
 export default async function handler(req: any, res: any) {
   if (req.method !== 'POST') {
@@ -82,12 +33,14 @@ export default async function handler(req: any, res: any) {
       return res.status(400).json({ error: 'Text is required and cannot be empty.' });
     }
 
-    if (!process.env.API_KEY) {
-      console.error("API_KEY environment variable not set.");
-      return res.status(500).json({ error: 'Server configuration error. API key is missing.' });
+    // Accept either GEMINI_API_KEY (used in README/vite) or API_KEY (legacy)
+    const apiKey = process.env.GEMINI_API_KEY ?? process.env.API_KEY;
+    if (!apiKey) {
+      console.error("Environment variable GEMINI_API_KEY or API_KEY not set.");
+      return res.status(500).json({ error: 'Server configuration error. GEMINI_API_KEY (or API_KEY) is missing.' });
     }
 
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY as string });
+    const ai = new GoogleGenAI({ apiKey: apiKey as string });
 
     const responseSchema = {
       type: Type.OBJECT,
@@ -110,18 +63,25 @@ export default async function handler(req: any, res: any) {
     };
 
     const prompt = `
-      You are an AI text processor. Your task is to humanize the user's text, improve its flow, and ensure originality.
-      You MUST provide your response strictly as a single, raw, valid JSON object that conforms to the provided schema.
-      Do not include any markdown wrappers like \`\`\`json, conversational text, or explanations.
-      Your entire output must be a JSON object parsable by JSON.parse().
+      You are an expert text editor and analyst. Given the following text, perform two tasks:
+      1. Create a single, final version of the text that is both **humanized** (sounds natural, less robotic, improved flow) and **plagiarism-free** (rephrased to ensure originality).
+      2. Generate a detailed analysis report in JSON format based on the original text and your improvements. The report should include:
+          - originalWordCount: The word count of the original text.
+          - finalWordCount: The word count of your final generated text.
+          - plagiarismBefore: Estimate a percentage, e.g., "15%".
+          - plagiarismAfter: Always set this to a low value like "0%" or "1%".
+          - humanLikenessScore: Estimate a percentage of how human-like the final text is, e.g., "95%".
+          - readabilityLevel: Choose from 'Basic', 'Intermediate', 'Advanced'.
 
-      Original Text to process:
+      The final output must be a single, valid JSON object that strictly adheres to the provided schema. Do not include any text or markdown formatting outside of the JSON object.
+
+      Original Text:
       ---
       ${text}
       ---
     `;
 
-    const modelResponse = await ai.models.generateContent({
+    const response = await ai.models.generateContent({
       model: 'gemini-2.5-flash',
       contents: prompt,
       config: {
@@ -130,25 +90,26 @@ export default async function handler(req: any, res: any) {
       },
     });
 
-    const responseText = modelResponse.text?.trim();
-
-    if (!responseText) {
-      throw new Error("Received an empty response from the AI model.");
+    const responseText = (response && typeof response.text === 'string') ? response.text.trim() : JSON.stringify(response);
+    let parsedJson;
+    try {
+      parsedJson = JSON.parse(responseText);
+    } catch (parseErr) {
+      console.error("Failed to parse AI response as JSON. Raw responseText:", responseText);
+      console.error("Parse error:", parseErr);
+      return res.status(502).json({ error: 'Bad gateway: AI returned invalid JSON.' });
     }
     
-    const parsedJson = extractAndParseJson(responseText);
-    
-    if (parsedJson) {
+    if (parsedJson && parsedJson.processedText && parsedJson.report) {
       res.setHeader('Content-Type', 'application/json');
       return res.status(200).json(parsedJson);
     } else {
-      console.error("Failed to extract a valid JSON object from the AI's response. Raw response:", responseText);
-      throw new Error("The AI model's response could not be parsed as valid JSON.");
+      console.error("Received malformed JSON response from AI:", parsedJson);
+      return res.status(502).json({ error: 'AI returned malformed data.' });
     }
     
   } catch (error) {
     console.error("Error in serverless function:", error);
-    const errorMessage = error instanceof Error ? error.message : 'An internal server error occurred while processing the text.';
-    return res.status(500).json({ error: errorMessage });
+    return res.status(500).json({ error: 'An internal server error occurred while processing the text.' });
   }
 }
