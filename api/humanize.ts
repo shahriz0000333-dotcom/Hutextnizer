@@ -1,9 +1,7 @@
-// In a real project, you would install @vercel/node and use VercelRequest, VercelResponse types.
-// Using `any` here to avoid needing external dependencies in this context.
+// Serverless handler supporting both Google GenAI (if GEMINI_API_KEY present)
+// or OpenRouter (if OPENROUTER_API_KEY present).
 import { GoogleGenAI, Type } from "@google/genai";
 
-// Types are duplicated from the frontend's types.ts because serverless functions
-// are built as separate endpoints and cannot directly import from the frontend source.
 interface ReportData {
   originalWordCount: number;
   finalWordCount: number;
@@ -18,7 +16,23 @@ interface AiResponse {
   report: ReportData;
 }
 
-// Vercel serverless function handler
+async function tryParseJsonFromString(s: string) {
+  try {
+    return JSON.parse(s);
+  } catch {
+    // Try to extract first {...} json substring (loose)
+    const match = s.match(/\{[\s\S]*\}/);
+    if (match) {
+      try {
+        return JSON.parse(match[0]);
+      } catch (e) {
+        // fall through
+      }
+    }
+    return null;
+  }
+}
+
 export default async function handler(req: any, res: any) {
   if (req.method !== 'POST') {
     res.setHeader('Allow', ['POST']);
@@ -33,81 +47,156 @@ export default async function handler(req: any, res: any) {
       return res.status(400).json({ error: 'Text is required and cannot be empty.' });
     }
 
-    // Accept either GEMINI_API_KEY (used in README/vite) or API_KEY (legacy)
-    const apiKey = process.env.GEMINI_API_KEY ?? process.env.API_KEY;
-    if (!apiKey) {
-      console.error("Environment variable GEMINI_API_KEY or API_KEY not set.");
-      return res.status(500).json({ error: 'Server configuration error. GEMINI_API_KEY (or API_KEY) is missing.' });
-    }
-
-    const ai = new GoogleGenAI({ apiKey: apiKey as string });
-
-    const responseSchema = {
-      type: Type.OBJECT,
-      properties: {
-        processedText: { type: Type.STRING, description: "The final, processed text that is both humanized and plagiarism-free." },
-        report: {
-          type: Type.OBJECT,
-          properties: {
-            originalWordCount: { type: Type.NUMBER },
-            finalWordCount: { type: Type.NUMBER, description: "The word count of the final processed text." },
-            plagiarismBefore: { type: Type.STRING, description: "An estimated plagiarism percentage for the original text, e.g., '15%'" },
-            plagiarismAfter: { type: Type.STRING, description: "An estimated plagiarism percentage for the processed text, e.g., '1%'" },
-            humanLikenessScore: { type: Type.STRING, description: "An estimated score of how human-like the text sounds, e.g., '95%'" },
-            readabilityLevel: { type: Type.STRING, description: "The readability level, must be one of 'Basic', 'Intermediate', or 'Advanced'." },
-          },
-          required: ['originalWordCount', 'finalWordCount', 'plagiarismBefore', 'plagiarismAfter', 'humanLikenessScore', 'readabilityLevel']
-        },
-      },
-      required: ['processedText', 'report']
-    };
+    const geminiKey = process.env.GEMINI_API_KEY ?? process.env.API_KEY;
+    const openRouterKey = process.env.OPENROUTER_API_KEY;
 
     const prompt = `
       You are an expert text editor and analyst. Given the following text, perform two tasks:
-      1. Create a single, final version of the text that is both **humanized** (sounds natural, less robotic, improved flow) and **plagiarism-free** (rephrased to ensure originality).
-      2. Generate a detailed analysis report in JSON format based on the original text and your improvements. The report should include:
-          - originalWordCount: The word count of the original text.
-          - finalWordCount: The word count of your final generated text.
-          - plagiarismBefore: Estimate a percentage, e.g., "15%".
-          - plagiarismAfter: Always set this to a low value like "0%" or "1%".
-          - humanLikenessScore: Estimate a percentage of how human-like the final text is, e.g., "95%".
-          - readabilityLevel: Choose from 'Basic', 'Intermediate', 'Advanced'.
-
-      The final output must be a single, valid JSON object that strictly adheres to the provided schema. Do not include any text or markdown formatting outside of the JSON object.
-
+      1. Create a single, final version of the text that is both humanized and plagiarism-free.
+      2. Generate a JSON report containing:
+         - originalWordCount (number)
+         - finalWordCount (number)
+         - plagiarismBefore (string like "15%")
+         - plagiarismAfter (string like "0%" or "1%")
+         - humanLikenessScore (string like "95%")
+         - readabilityLevel (one of 'Basic','Intermediate','Advanced')
+      The final output must be a single valid JSON object and nothing else.
       Original Text:
       ---
       ${text}
       ---
     `;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: responseSchema,
-      },
-    });
+    // If GEMINI key present, use GoogleGenAI SDK (existing behavior)
+    if (geminiKey) {
+      try {
+        const ai = new GoogleGenAI({ apiKey: geminiKey as string });
 
-    const responseText = (response && typeof response.text === 'string') ? response.text.trim() : JSON.stringify(response);
-    let parsedJson;
-    try {
-      parsedJson = JSON.parse(responseText);
-    } catch (parseErr) {
-      console.error("Failed to parse AI response as JSON. Raw responseText:", responseText);
-      console.error("Parse error:", parseErr);
-      return res.status(502).json({ error: 'Bad gateway: AI returned invalid JSON.' });
+        const responseSchema = {
+          type: Type.OBJECT,
+          properties: {
+            processedText: { type: Type.STRING },
+            report: {
+              type: Type.OBJECT,
+              properties: {
+                originalWordCount: { type: Type.NUMBER },
+                finalWordCount: { type: Type.NUMBER },
+                plagiarismBefore: { type: Type.STRING },
+                plagiarismAfter: { type: Type.STRING },
+                humanLikenessScore: { type: Type.STRING },
+                readabilityLevel: { type: Type.STRING },
+              },
+              required: ['originalWordCount','finalWordCount','plagiarismBefore','plagiarismAfter','humanLikenessScore','readabilityLevel']
+            }
+          },
+          required: ['processedText','report']
+        };
+
+        const response = await ai.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: prompt,
+          config: {
+            responseMimeType: 'application/json',
+            responseSchema
+          }
+        });
+
+        const responseText = (response && typeof response.text === 'string') ? response.text.trim() : JSON.stringify(response);
+        const parsed = await tryParseJsonFromString(responseText);
+
+        if (parsed && parsed.processedText && parsed.report) {
+          return res.status(200).json(parsed);
+        } else {
+          console.error("GoogleGenAI returned unexpected data:", responseText);
+          return res.status(502).json({ error: 'AI returned malformed data (GoogleGenAI).' });
+        }
+      } catch (err: any) {
+        console.error("Error calling GoogleGenAI:", err);
+        // If API key invalid or any other error, return that message
+        const message = err?.message || 'Unknown error from GoogleGenAI';
+        return res.status(500).json({ error: `GoogleGenAI error: ${message}` });
+      }
     }
-    
-    if (parsedJson && parsedJson.processedText && parsedJson.report) {
-      res.setHeader('Content-Type', 'application/json');
-      return res.status(200).json(parsedJson);
-    } else {
-      console.error("Received malformed JSON response from AI:", parsedJson);
-      return res.status(502).json({ error: 'AI returned malformed data.' });
+
+    // Else try OpenRouter
+    if (openRouterKey) {
+      try {
+        const orEndpoint = 'https://api.openrouter.ai/v1/chat/completions';
+        const payload = {
+          model: 'gpt-4o-mini', // change model if you need a different one available on your OpenRouter plan
+          messages: [
+            { role: 'user', content: prompt }
+          ],
+          temperature: 0.2,
+          max_tokens: 2000
+        };
+
+        const resp = await fetch(orEndpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${openRouterKey}`
+          },
+          body: JSON.stringify(payload),
+        });
+
+        const respText = await resp.text();
+        if (!resp.ok) {
+          console.error("OpenRouter responded with non-OK:", resp.status, respText);
+          // Try to parse JSON error body
+          let errBody;
+          try { errBody = JSON.parse(respText); } catch {}
+          return res.status(resp.status).json({ error: 'OpenRouter API error', details: errBody ?? respText });
+        }
+
+        // Parse the OpenRouter success response
+        let json;
+        try {
+          json = JSON.parse(respText);
+        } catch (e) {
+          console.error("OpenRouter returned non-JSON:", respText);
+          return res.status(502).json({ error: 'OpenRouter returned non-JSON response.' });
+        }
+
+        // Extract text from common response shapes
+        let assistantContent: string | null = null;
+        if (json.choices && Array.isArray(json.choices) && json.choices[0]) {
+          const ch = json.choices[0];
+          // Try different fields depending on OpenRouter shape
+          assistantContent = ch.message?.content ?? ch.message ?? ch.text ?? ch.delta?.content ?? null;
+        } else if (json.output && Array.isArray(json.output) && json.output[0]) {
+          assistantContent = typeof json.output[0].content === 'string' ? json.output[0].content : null;
+        }
+
+        if (!assistantContent) {
+          // As a last resort, stringify entire response and try to pull JSON out
+          const attempt = await tryParseJsonFromString(JSON.stringify(json));
+          if (attempt && attempt.processedText && attempt.report) {
+            return res.status(200).json(attempt);
+          }
+          console.error("Could not find assistant content in OpenRouter response:", JSON.stringify(json));
+          return res.status(502).json({ error: 'OpenRouter returned unexpected shape.' });
+        }
+
+        // assistantContent may contain the JSON object as text — try to parse
+        const parsed = await tryParseJsonFromString(assistantContent);
+        if (parsed && parsed.processedText && parsed.report) {
+          return res.status(200).json(parsed);
+        } else {
+          console.error("OpenRouter assistant content could not be parsed as JSON. Raw:", assistantContent);
+          return res.status(502).json({ error: 'OpenRouter returned content that is not valid JSON.' });
+        }
+
+      } catch (err: any) {
+        console.error("Error calling OpenRouter:", err);
+        return res.status(500).json({ error: `OpenRouter error: ${err?.message ?? String(err)}` });
+      }
     }
-    
+
+    // No API key available
+    console.error("No GEMINI_API_KEY or OPENROUTER_API_KEY environment variable found.");
+    return res.status(500).json({ error: 'Server configuration error. Set GEMINI_API_KEY or OPENROUTER_API_KEY.' });
+
   } catch (error) {
     console.error("Error in serverless function:", error);
     return res.status(500).json({ error: 'An internal server error occurred while processing the text.' });
