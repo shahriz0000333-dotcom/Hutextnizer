@@ -1,5 +1,6 @@
 // Serverless handler: prefer OpenRouter (if OPENROUTER_API_KEY present), else Google GenAI (if GEMINI_API_KEY present).
 import { GoogleGenAI, Type } from "@google/genai";
+import dns from 'dns';
 
 interface ReportData {
   originalWordCount: number;
@@ -27,6 +28,16 @@ async function tryParseJsonFromString(s: string) {
         // fall through
       }
     }
+    return null;
+  }
+}
+
+async function resolveHostname(hostname: string) {
+  try {
+    const lookup = dns.promises.lookup;
+    const res = await lookup(hostname);
+    return res; // { address, family }
+  } catch (err) {
     return null;
   }
 }
@@ -67,10 +78,21 @@ export default async function handler(req: any, res: any) {
 
     // Prefer OpenRouter if key provided
     if (openRouterKey) {
+      // DNS check before network call
+      const host = 'api.openrouter.ai';
+      const resolved = await resolveHostname(host);
+      if (!resolved) {
+        console.error(`DNS lookup failed for ${host}. Cannot reach OpenRouter from this environment.`);
+        return res.status(502).json({
+          error: 'DNS lookup failed for api.openrouter.ai. Possible network/DNS issue from the deployment environment.',
+          suggestion: 'Check network egress/DNS in your hosting environment or use GEMINI_API_KEY instead.'
+        });
+      }
+
       try {
         const orEndpoint = 'https://api.openrouter.ai/v1/chat/completions';
         const payload = {
-          model: 'gpt-4o-mini', // change if not available on your plan
+          model: 'gpt-4o-mini',
           messages: [{ role: 'user', content: prompt }],
           temperature: 0.2,
           max_tokens: 2000
